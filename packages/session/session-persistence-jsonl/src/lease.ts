@@ -31,10 +31,12 @@
 import { mkdir, open, stat } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { join } from 'node:path'
-import { flock } from 'fs-ext'
 import { SessionAlreadyOwnedError } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { acquireLockHandleWin32, releaseLockHandleWin32 } from './win32.ts'
+
+/** The fs-ext flock face, referenced only as a type so an absent addon never loads here. */
+type Flock = typeof import('fs-ext')['flock']
 
 /** Base name of the kernel lock file inside a session's directory. */
 export const LEASE_FILENAME = 'session.lock'
@@ -44,8 +46,24 @@ type HeldLock =
   | { readonly kind: 'posix'; readonly handle: FileHandle }
   | { readonly kind: 'win32'; readonly handle: number }
 
+/** The lazily loaded fs-ext flock binding, set on first POSIX acquisition. */
+let flockBinding: Flock | undefined
+
+/**
+ * Load fs-ext on first use. fs-ext is POSIX-only (its addon cannot build or load
+ * on Windows), so the module scope never touches it; the Win32 lease path in
+ * {@link SessionWriteLease.acquire} goes through the koffi-backed helpers in
+ * ./win32.ts instead. Mirroring that file's lazy Koffi import, the dependency is
+ * an optional one and loading here is the only point an absent addon surfaces.
+ */
+async function loadFlock(): Promise<Flock> {
+  if (flockBinding !== undefined) return flockBinding
+  flockBinding = (await import('fs-ext')).flock
+  return flockBinding
+}
+
 /** Promise face over fs-ext's callback flock, pinned to its string-flag overload. */
-function flockAsync(fd: number, flags: 'exnb' | 'un'): Promise<void> {
+function flockAsync(flock: Flock, fd: number, flags: 'exnb' | 'un'): Promise<void> {
   return new Promise((resolve, reject) => {
     flock(fd, flags, (error) => {
       if (error) reject(error)
@@ -97,11 +115,12 @@ export class SessionWriteLease {
     /* v8 ignore stop */
     // Bounded retry: locking an inode a releasing creator just unlinked (or a
     // recreated path) re-opens the fresh file; steady state needs one pass.
+    const flock = await loadFlock()
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const handle = await open(path, 'w')
       try {
         try {
-          await flockAsync(handle.fd, 'exnb')
+          await flockAsync(flock, handle.fd, 'exnb')
         } catch (error: unknown) {
           if (isLockContention(error)) throw new SessionAlreadyOwnedError(id)
           throw error

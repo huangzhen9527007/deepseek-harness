@@ -36,9 +36,11 @@
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-session-format": "workspace:^",
     "@deepseek-ai/dsh-session-format-catalog": "workspace:^",
-    "fs-ext": "2.1.1",
     "koffi": "^3.1.0",
     "@deepseek-ai/schemastery": "workspace:^"
+  },
+  "optionalDependencies": {
+    "fs-ext": "2.1.1"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-session": "workspace:^",

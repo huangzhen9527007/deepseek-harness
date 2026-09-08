@@ -1,0 +1,24 @@
+diff --git a/package.json b/package.json
+index 7672237decae0439ad89265738b151d90cd05b64..b82e0a62d1d19e518872c3870bf2eb6beae8bf38 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,10 @@
+     "seek"
+   ],
+   "version": "2.1.1",
++  "os": [
++    "linux",
++    "darwin"
++  ],
+   "homepage": "https://github.com/baudehlo/node-fs-ext/",
+   "repository": {
+     "type": "git",
+@@ -31,7 +35,7 @@
+     "web": "https://github.com/baudehlo/node-fs-ext/issues"
+   },
+   "scripts": {
+-    "install": "node-gyp configure build",
++    "install": "node -e \"if (process.platform === 'win32') process.exit(0); require('child_process').execFileSync('node-gyp', ['configure', 'build'], { stdio: 'inherit' })\"",
+     "test": "node ./run_tests",
+     "lint": "node ./node_modules/eslint/bin/eslint \"*.js\" \"tests/**/*.js\"",
+     "cover": "NODE_ENV=cov ./node_modules/.bin/istanbul cover node ./run_tests"
