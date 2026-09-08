@@ -585,8 +585,12 @@
   width: 100%;
 }
 
+/* Footer actions stack vertically so each occupant (e.g. a toggle button and
+   an external plugin section) gets its own full-width row instead of sharing
+   one crowded horizontal line beside Settings. */
 .footerActions {
   display: flex;
+  flex-direction: column;
 }
 
 .collapsed .footArea {
