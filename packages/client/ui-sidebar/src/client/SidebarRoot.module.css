@@ -331,8 +331,11 @@
   width: 100%;
 }
 
+/* Several extensions may occupy the footer-action list slot; a column gives
+   each occupant a full-width row instead of squeezing them onto one line. */
 .footerActions {
   display: flex;
+  flex-direction: column;
 }
 
 .collapsed .footArea {
