@@ -9,14 +9,17 @@ import {
   proxyEnvironmentForChild,
   proxyRouteFor,
 } from '../src/index.ts'
-import { PROXY_ENV_NAMES } from '../src/policy.ts'
+import { installGlobalProxy } from '../src/install.ts'
+import { PROXY_ENV_NAMES, resolveProxyPolicy } from '../src/policy.ts'
 
 /** Absolute-form request targets the fake proxy received; a populated entry proves a request was tunnelled. */
 let proxied: string[] = []
 let proxy: Server
 let origin: Server
+let stall: Server
 let proxyUrl: string
 let originUrl: string
+let stallUrl: string
 
 /**
  * The target for every assertion about a tunnelled hop. It is deliberately not loopback: no policy
@@ -46,13 +49,24 @@ beforeAll(async () => {
     socket.end()
   })
   origin = createServer((_request, response) => { response.end('DIRECT') })
-  const [proxyAddress, originAddress] = await Promise.all([listen(proxy), listen(origin)])
+  // Headers and one chunk, then silence: what a model prefilling a long prompt sends over the wire.
+  stall = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    response.write('data: {"first":true}\n\n')
+    const finish = setTimeout(() => { response.end('data: [DONE]\n\n') }, 30_000)
+    // Neither the timer nor the socket may outlive the case. The resume is unreachable once a case
+    // has aborted, and `unref` keeps a case that fails before it does from holding the suite open.
+    finish.unref()
+    response.on('close', () => { clearTimeout(finish) })
+  })
+  const [proxyAddress, originAddress, stallAddress] = await Promise.all([listen(proxy), listen(origin), listen(stall)])
   proxyUrl = `http://127.0.0.1:${String(proxyAddress.port)}`
   originUrl = `http://127.0.0.1:${String(originAddress.port)}/probe`
+  stallUrl = `http://127.0.0.1:${String(stallAddress.port)}/stream`
 })
 
 afterAll(async () => {
-  await Promise.all([close(proxy), close(origin)])
+  await Promise.all([close(proxy), close(origin), close(stall)])
 })
 
 afterEach(() => {
@@ -171,17 +185,24 @@ describe('installProxyFromEnvironment', () => {
     await expect((await fetch(originUrl)).text()).resolves.toBe('DIRECT')
   })
 
-  it('installs no dispatcher and touches no environment when the user exported none', async () => {
+  it('installs a direct dispatcher, and touches no environment, when the user exported none', async () => {
     const before = getGlobalDispatcher()
     process.env.HTTP_PROXY = 'http://untouched.example'
     const { dispose, reported } = await install(env({}))
     try {
-      expect(getGlobalDispatcher()).toBe(before)
+      // The transport's own idle limits belong to this package, so a policy that proxies nothing
+      // still installs a dispatcher: leaving undici's default agent in place would keep its
+      // five-minute bound on every stream, and `installGlobalProxy` is the only place that decides
+      // what the harness's transport is.
+      expect(getGlobalDispatcher()).not.toBe(before)
+      // Routing is what did not change: the direct agent reaches the origin exactly as the default.
+      await expect((await fetch(originUrl)).text()).resolves.toBe('DIRECT')
       expect(process.env.HTTP_PROXY).toBe('http://untouched.example')
       expect(reported).toEqual([])
       expect(proxyRouteFor(new URL(proxyTarget))).toEqual({ proxied: false })
     } finally {
       await dispose()
+      expect(getGlobalDispatcher()).toBe(before)
       delete process.env.HTTP_PROXY
     }
   })
@@ -200,6 +221,28 @@ describe('installProxyFromEnvironment', () => {
       // The same policy still tunnels http, so the empty expectation above is not vacuous.
       await expect((await fetch(proxyTarget)).text()).resolves.toBe('VIA-PROXY')
       expect(proxied).toEqual([`GET ${proxyTarget}`])
+    } finally {
+      await dispose()
+    }
+  })
+})
+
+describe('the transport idle limit', () => {
+  it('is the install\'s to arm, so a stalled stream is not cut at undici\'s five minutes', async () => {
+    // What undici's own default ends at 300000 ms. The budget here is the point of the case: the
+    // installed dispatcher carries it, which is the property a caller relying on its own deadline
+    // needs. Production passes 0 — no timer at all — and a case cannot wait out a timer that is
+    // never armed, so the same code path is driven with a budget the suite can outlast.
+    const { policy } = resolveProxyPolicy(env({}))
+    const dispose = await installGlobalProxy(policy, 1200)
+    try {
+      // The caller's own deadline is four times the transport's, so an install that failed to arm
+      // the transport would surface this signal instead — and fail the assertion below rather than
+      // pass by timing out for an unrelated reason.
+      const response = await fetch(stallUrl, { signal: AbortSignal.timeout(5000) })
+      const failure: unknown = await response.text().then(() => undefined, (error: unknown) => error)
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as { cause?: { code?: string } }).cause?.code).toBe('UND_ERR_BODY_TIMEOUT')
     } finally {
       await dispose()
     }

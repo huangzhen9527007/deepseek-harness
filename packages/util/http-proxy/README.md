@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use this package to apply one outbound HTTP proxy policy to Harness requests that use Node's built-in `fetch`, including LLM, web-search, and HTTP MCP traffic. The launcher reads standard proxy environment variables once, and ordinary `fetch` callers require no extra imports or changes. Local loopback traffic stays direct, while unsupported proxy URLs are reported and skipped for the affected scheme. Public helpers let callers route transports with their own proxy settings, prepare child-process environments, or clear proxy variables for isolated replays.
+Use this package to apply one outbound HTTP proxy policy to Harness requests that use Node's built-in `fetch`, including LLM, web-search, and HTTP MCP traffic. The launcher reads standard proxy environment variables once, and ordinary `fetch` callers require no extra imports or changes. Local loopback traffic stays direct, while unsupported proxy URLs are reported and skipped for the affected scheme. The install owns the transport's own idle limits as well, which is why a user who exports no proxy still gets a dispatcher: undici's default ends a silent stream after five minutes, and no configuration reaches it. Public helpers let callers route transports with their own proxy settings, prepare child-process environments, or clear proxy variables for isolated replays.
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ Use this package to apply one outbound HTTP proxy policy to Harness requests tha
 <a id="use-this-package"></a>
 ## Use this package
 
-Nothing to mount, and nothing to configure. The `dsh` launcher resolves and installs the policy for every profile before the first plugin loads, so a user who exports `HTTPS_PROXY` is proxied everywhere. This is a library rather than a plugin because transport policy has one answer per process: there is no second implementation to swap and no scope narrower than the process to give one.
+Nothing to mount, and nothing to configure. The `dsh` launcher resolves and installs the policy for every profile before the first plugin loads, so a user who exports `HTTPS_PROXY` is proxied everywhere. That one call also installs a dispatcher when no proxy applies, because the transport's own idle limits are decided here rather than left to undici's defaults. This is a library rather than a plugin because transport policy has one answer per process: there is no second implementation to swap and no scope narrower than the process to give one.
 
 ### Writing a new outbound call
 
@@ -66,12 +66,14 @@ A proxy value the package cannot use — a SOCKS or PAC URL, an unparseable stri
 
 **A child inherits the user's own values, and the resolved policy for what they left unset.** A scheme the user named in either casing reaches a child exactly as they wrote it, so a SOCKS proxy `curl` uses is never replaced by an HTTP one named for another scheme. A scheme they named in neither casing carries the resolved value instead, because otherwise the child's routing diverges from its parent's: Node's `NODE_USE_ENV_PROXY` does not read `ALL_PROXY`. The bypass list is always the resolved one — it only ever adds the loopback entries, so nothing the user wrote is lost. The cost of one routing answer for parent and child alike is that `curl` also sees the `https:` proxy this package derives from the HTTP one. One exception protects the child itself: when a value it receives is one this package refused — a SOCKS URL kept for `curl` — the `NODE_USE_ENV_PROXY` flag is withheld, because Node parses `HTTP_PROXY` and `HTTPS_PROXY` under that flag before running the program and exits on such a value. A child Node then connects directly, as this process already reported for that scheme, instead of failing to start.
 
+**The caller owns the deadline, not the transport.** undici arms a 300000 ms timer for the wait on response headers and for the gap between two body chunks, and that default sits below every caller: nothing configures it, so a stream a caller's own deadline still allows ends after five minutes of silence. That is the ordinary case for a local model prefilling a long prompt, which writes nothing for minutes, and the failure is a bare `terminated` whose `UND_ERR_BODY_TIMEOUT` cause the provider stack has already flattened away. The installed dispatcher therefore arms no timer of its own — zero disables both in undici, on HTTP/1 and HTTP/2 alike — and each caller's deadline is the one that decides: the LLM adapters own `streamIdleTimeoutMs`, `dsh-web-fetch-http` and the MCP client own theirs.
+
 ### Source map
 
 | File | Holds |
 |---|---|
 | `src/policy.ts` | Resolution and bypass matching; a diagnostic names the variable, never its value. Imports no transport, so it stays loadable where undici is absent. |
-| `src/install.ts` | The global dispatcher, the active-policy record, the route, and the child environment. Imports undici dynamically. |
+| `src/install.ts` | The global dispatcher, the transport's idle limits, the active-policy record, the route, and the child environment. Imports undici dynamically. |
 | `src/index.ts` | The package face: four functions and one type. |
 
 ### Bypass matching

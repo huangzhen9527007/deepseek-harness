@@ -1,6 +1,7 @@
 /**
- * Proxy installation: the transport half of this package. It owns undici's global dispatcher and the
- * process-wide record of which policy is active.
+ * Proxy installation: the transport half of this package. It owns undici's global dispatcher, the
+ * process-wide record of which policy is active, and the transport's own idle limits — the second of
+ * which is why a policy that proxies nothing still installs a dispatcher.
  *
  * `undici` is imported dynamically so the pure {@link ProxyPolicy} half stays loadable where no Node
  * transport exists, matching how `dsh-web-fetch-http` defers its own transport import.
@@ -129,6 +130,21 @@ function writeProxyEnv(values: Readonly<Record<string, string | undefined>>): ()
 }
 
 /**
+ * The transport's own idle limits: none.
+ *
+ * undici arms a 300000 ms timer both for the wait on response headers and for the gap between two
+ * body chunks, and that default sits below every caller: nothing configures it, and a stream the
+ * caller's own deadline still allows ends after five minutes of silence. That is the ordinary case
+ * for a local model prefilling a long prompt, which writes nothing for minutes, and it arrives as a
+ * bare `terminated` whose `UND_ERR_BODY_TIMEOUT` cause the provider stack has already flattened away.
+ *
+ * Zero arms no timer — undici's HTTP/1 `Parser.setTimeout` and both HTTP/2 guards test the value —
+ * so the transport declines to bound the wait and the caller's deadline is the one that decides: the
+ * LLM adapters own `streamIdleTimeoutMs`, `web-fetch-http` and the MCP client own theirs.
+ */
+const TRANSPORT_IDLE_MS = 0
+
+/**
  * Build the global dispatcher for one policy.
  *
  * Routing runs through {@link proxyForUrl} per origin, so `fetch` and every caller that asks where a
@@ -138,12 +154,18 @@ function writeProxyEnv(values: Readonly<Record<string, string | undefined>>): ()
  * the user named for it — the route and the diagnostic would then disagree.
  *
  * @param policy - the policy to route by; it must proxy at least one scheme.
+ * @param transportIdleMs - idle limit for every connection this dispatcher owns; see
+ *   {@link TRANSPORT_IDLE_MS}.
  * @returns the dispatcher to install, owning every per-origin agent its factory created.
  */
-async function createPolicyDispatcher(policy: ProxyPolicy): Promise<Dispatcher> {
+async function createPolicyDispatcher(policy: ProxyPolicy, transportIdleMs: number): Promise<Dispatcher> {
   const { Agent, Pool, ProxyAgent } = await import('undici')
   return new Agent({
+    headersTimeout: transportIdleMs,
+    bodyTimeout: transportIdleMs,
     factory(origin, options) {
+      // The agent hands its own options down to this factory, so the pool or proxy agent built here
+      // inherits the idle limits above rather than arming undici's default timer.
       // undici declares this parameter as `Object`, discarding the pool options it actually passes.
       const passed = options as Pool.Options
       const proxy = proxyForUrl(policy, new URL(origin.toString()))
@@ -161,7 +183,10 @@ async function createPolicyDispatcher(policy: ProxyPolicy): Promise<Dispatcher> 
  *
  * Installing replaces undici's global dispatcher, which is what Node's built-in `fetch` resolves, so
  * every caller that issues a plain `fetch()` is covered without knowing this package exists. A policy
- * that proxies nothing installs a direct dispatcher and leaves the environment untouched.
+ * that proxies nothing installs a direct dispatcher and leaves the environment untouched: that
+ * dispatcher routes exactly as undici's own default agent does, and differs from it only by
+ * {@link TRANSPORT_IDLE_MS}, which is part of what this package owns and cannot be reached by
+ * leaving the default in place.
  *
  * A worker thread has its own `globalThis` and so its own dispatcher; installing here does not
  * reach it. No worker installs one today: both this repository ships — the workflow engine and the
@@ -169,56 +194,45 @@ async function createPolicyDispatcher(policy: ProxyPolicy): Promise<Dispatcher> 
  * credentials. A worker that needs the policy has to be handed one explicitly and install it itself.
  *
  * @param policy - the resolved policy to install.
+ * @param transportIdleMs - idle limit for every connection installed here, in milliseconds; `0`
+ *   arms none. Tests set a value the suite can wait for, so the transport is observed behaving
+ *   rather than asserted to be configured; production always passes the default.
  * @returns a disposer restoring the previous dispatcher, policy, and environment, then closing the agent.
  */
-async function installGlobalProxy(policy: ProxyPolicy): Promise<() => Promise<void>> {
+export async function installGlobalProxy(
+  policy: ProxyPolicy,
+  transportIdleMs: number = TRANSPORT_IDLE_MS,
+): Promise<() => Promise<void>> {
   const previousPolicy = active
-  if (policy.source === 'none') {
-    // A direct policy mounted over an installed one must actually stop proxying. Recording the policy
-    // alone would leave the previous agent as the global dispatcher, so a plain `fetch()` would keep
-    // tunnelling while `proxyForUrl()` reported a direct connection — and `mode: 'off'` would be a
-    // silent no-op. With nothing installed there is nothing to displace.
-    if (previousPolicy === undefined) {
-      active = policy
-      return () => {
-        active = previousPolicy
-        return Promise.resolve()
-      }
-    }
-    const previousInstalled = installed
-    // The install underneath published its normalized policy into `process.env`, which is what a
-    // spawned child copies. With no policy active there is no normalization to stand behind, so the
-    // user's own values return for the window and the outer install's come back when it ends. An
-    // install underneath that proxied nothing published nothing, and there is nothing to put back.
-    const restoreEnv = inheritedProxyEnv === undefined ? undefined : writeProxyEnv(inheritedProxyEnv)
-    const undici = await import('undici')
-    const previous = undici.getGlobalDispatcher()
-    const direct = new undici.Agent()
-    undici.setGlobalDispatcher(direct)
-    active = policy
-    installed = undefined
-    return async () => {
-      undici.setGlobalDispatcher(previous)
-      active = previousPolicy
-      installed = previousInstalled
-      restoreEnv?.()
-      await direct.close()
-    }
-  }
-  const restoreEnv = applyPolicyEnv(policy)
-  const { getGlobalDispatcher, setGlobalDispatcher } = await import('undici')
-  const previousDispatcher = getGlobalDispatcher()
   const previousInstalled = installed
-  const agent = await createPolicyDispatcher(policy)
-  setGlobalDispatcher(agent)
+  const undici = await import('undici')
+  const previousDispatcher = undici.getGlobalDispatcher()
+  const restoreEnv = policy.source === 'none'
+    // A direct policy must actually stop proxying: recording the policy alone would leave the
+    // previous agent as the global dispatcher, so a plain `fetch()` would keep tunnelling while
+    // `proxyForUrl()` reported a direct connection — and `mode: 'off'` would be a silent no-op.
+    //
+    // It also publishes nothing, while the install underneath published its normalized policy into
+    // `process.env`, which is what a spawned child copies. With no policy active there is no
+    // normalization to stand behind, so the user's own values return for the window and the outer
+    // install's come back when it ends. An install underneath that proxied nothing published
+    // nothing, and there is nothing to put back.
+    ? inheritedProxyEnv === undefined ? undefined : writeProxyEnv(inheritedProxyEnv)
+    : applyPolicyEnv(policy)
+  const dispatcher = policy.source === 'none'
+    ? new undici.Agent({ headersTimeout: transportIdleMs, bodyTimeout: transportIdleMs })
+    : await createPolicyDispatcher(policy, transportIdleMs)
+  undici.setGlobalDispatcher(dispatcher)
   active = policy
-  installed = agent
+  // A direct policy routes nothing, so `proxyRouteFor` has no transport to hand back: the dispatcher
+  // above is process-wide and is not a route.
+  installed = policy.source === 'none' ? undefined : dispatcher
   return async () => {
-    setGlobalDispatcher(previousDispatcher)
+    undici.setGlobalDispatcher(previousDispatcher)
     active = previousPolicy
     installed = previousInstalled
-    restoreEnv()
-    await agent.close()
+    restoreEnv?.()
+    await dispatcher.close()
   }
 }
 
