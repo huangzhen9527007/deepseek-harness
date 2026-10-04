@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write(//d/DemensionDoorCRM/**)",
+      "Bash(python:*)",
+      "Bash(cd /d/DemensionDoorCRM/*)",
+      "Bash(find /d/DemensionDoorCRM/*)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc -l *)",
+      "Bash(ls:*)",
+      "Read(//d/DemensionDoorCRM/**)"
+    ],
+    "deny": []
+  }
+}
